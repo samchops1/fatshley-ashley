@@ -1,7 +1,8 @@
-
+/* Patron spawn, lines, interaction for Fatshley Ashley */
 (function (global) {
   'use strict';
 
+  // Line IDs: patron_bark_01 … patron_bark_24 (order = array index)
   const PICKUP_LINES = [
     "Stool lonely, or you just mean?",
     "Round's on me… if alimony allows.",
@@ -18,6 +19,7 @@
     "Ain't much — vertical and breathing.",
     "Last call's coming. Your number isn't.",
     "Booth. You. Me. Zero good decisions.",
+    // patron_bark_16+
     "Kid left for college. Guess I'm free.",
     "These kneepads? Bad back. Not a lifestyle.",
     "Name's… unimportant. Yours isn't.",
@@ -29,6 +31,7 @@
     "Buy you a shot? Or six. I'm flexible.",
   ];
 
+  // Ashley reactions — IDs ash_ignore_*, ash_flirt_up_*, ash_flirt_down_*, ash_yell_*
   const ASHLEY_IGNORE = [
     "Not today, grandpa vibes.",
     "Talk to the vodka.",
@@ -56,6 +59,33 @@
     "Security's imaginary. Still leave!",
     "Wrong woman, wrong night!",
     "Bye forever, champ.",
+    // ash_yell_coke_* — wired, manic
+    "I SAID LEAVE BEFORE I SNORT THE BAR!",
+    "WHO TOUCHED MY LINE?!",
+  ];
+
+  // Sameer lock: rails coke, yells, crashes out — IDs ash_rail_*, ash_crash_*
+  const ASHLEY_RAIL = [
+    "One more line. For science.",
+    "Nose goes. Brain follows. Maybe.",
+    "Rails before Last Call. Non-negotiable.",
+    "Powdered courage. Instant regret pending.",
+  ];
+
+
+  // Crash-out — IDs ash_crash_01–06 (Narrative lock)
+  const ASHLEY_CRASH = [
+    "Vision's a slideshow. Bad playlist.",
+    "Floor's hugging me. Rude.",
+    "I peaked. Then I cratered.",
+    "Tell the bartender I died funny.",
+    "Crash-out speedrun. Any %.",
+    "Lights out at Candlelight. Classic.",
+    "EVERYBODY OUT OF MY FACE!",
+    "I SAID I'M FINE — CLEARLY A LIE!",
+    "ONE MORE WORD AND THIS STOOL FLIES!",
+    "CRASHING OUT! DEAL WITH IT!",
+    "THIS BAR OWES ME AN APOLOGY!",
   ];
 
   let lineIdx = 0;
@@ -83,7 +113,10 @@
   function ashleyIgnore() { return pick(ASHLEY_IGNORE); }
   function ashleyFlirt(up) { return pick(up ? ASHLEY_FLIRT_UP : ASHLEY_FLIRT_DOWN); }
   function ashleyYell() { return pick(ASHLEY_YELL); }
+  function ashleyRail() { return pick(ASHLEY_RAIL); }
+  function ashleyCrash() { return pick(ASHLEY_CRASH); }
 
+  // Mid-round ambient chaos — IDs bar_event_01 …
   const BAR_EVENTS = [
     "Jukebox stuck on Wonderwall. Again.",
     "Greasy burger just hit the island bar.",
@@ -114,10 +147,14 @@
     return line;
   }
 
+  // Last-call beat — ID bar_lastcall_warn
   const LAST_CALL_WARN = "LAST CALL at Candlelight Tavern. Finish or faceplant.";
   function lastCallWarn() { return LAST_CALL_WARN; }
 
-  
+  /**
+   * Patron entity
+   * state: approaching | talking | leaving | gone
+   */
   function createPatron(W, H, fromLeft) {
     const variant = Math.floor(Math.random() * 4);
     const targetX = 60 + Math.random() * (W - 120);
@@ -150,6 +187,7 @@
       }
     } else if (p.state === 'talking') {
       p.talkTimer += dt;
+      // Auto-leave if ignored too long (~8s)
       if (p.talkTimer > 8) {
         p.state = 'leaving';
         p.leaveDir = Math.random() < 0.5 ? -1 : 1;
@@ -171,12 +209,16 @@
     ASHLEY_FLIRT_UP,
     ASHLEY_FLIRT_DOWN,
     ASHLEY_YELL,
+    ASHLEY_RAIL,
+    ASHLEY_CRASH,
     BAR_EVENTS,
     nextLine,
     shuffleLines,
     ashleyIgnore,
     ashleyFlirt,
     ashleyYell,
+    ashleyRail,
+    ashleyCrash,
     nextBarEvent,
     lastCallWarn,
     createPatron,

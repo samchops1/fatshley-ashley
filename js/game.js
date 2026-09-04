@@ -1,4 +1,4 @@
-
+/* Fatshley Ashley — main game loop */
 (function () {
   'use strict';
 
@@ -12,6 +12,7 @@
   const ctx = canvas.getContext('2d');
   const muteBtn = document.getElementById('btn-mute');
 
+  // Audio (simple Web Audio beeps — no external files)
   let muted = localStorage.getItem('fatshley_muted') === '1';
   let audioCtx = null;
 
@@ -19,7 +20,7 @@
     if (!audioCtx) {
       try {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      } catch (e) {  }
+      } catch (e) { /* no audio */ }
     }
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
   }
@@ -37,7 +38,7 @@
       g.connect(audioCtx.destination);
       o.start();
       o.stop(audioCtx.currentTime + dur);
-    } catch (e) {  }
+    } catch (e) { /* ignore */ }
   }
 
   function updateMuteUI() {
@@ -70,6 +71,7 @@
     localStorage.setItem(HS_KEY, String(s));
   }
 
+  // Game state
   let state = 'title'; // title | play | results
   let frame = 0;
   let lastTs = 0;
@@ -86,6 +88,12 @@
   let nextSpawn = 3;
   let activePatron = null;
   let drinkCooldown = 0;
+  let linesDone = 0;
+  let linesSinceCrash = 0;
+  let lineCooldown = 0;
+  let crashCooldown = 0;
+  let crashOutTimer = 0; // 0 = not crashing
+  let ashBark = null; // optional {text, life} speech over Ashley
   let floatTexts = [];
   let pressed = {}; // aggregated: left/right/drink/… (+ _keyLeft/_keyRight)
   let resultData = null;
@@ -95,8 +103,9 @@
   let survived = 0;
   let showPatronUI = false;
 
+  // --- Multi-touch: Map keyed by identifier (mouse = 'mouse') ---
   const pointers = new Map();
-  const RELEASE_ACTIONS = { drink: 1, ignore: 1, flirt: 1, yell: 1, play: 1, retry: 1 };
+  const RELEASE_ACTIONS = { drink: 1, line: 1, crash: 1, ignore: 1, flirt: 1, yell: 1, play: 1, retry: 1 };
   const HOLD_ACTIONS = { left: 1, right: 1 };
 
   function resetGame() {
@@ -113,6 +122,10 @@
     nextSpawn = 2.5;
     activePatron = null;
     drinkCooldown = 0;
+    lineCooldown = 0;
+    crashCooldown = 0;
+    crashOutTimer = 0;
+    ashBark = null;
     floatTexts = [];
     pressed = {};
     pointers.clear();
@@ -122,8 +135,8 @@
     Patrons.shuffleLines();
   }
 
-  function addFloat(text, x, y, color) {
-    floatTexts.push({ text: text, x: x, y: y, color: color || '#ffcc44', life: 1.2 });
+  function addFloat(text, x, y, color, life) {
+    floatTexts.push({ text: text, x: x, y: y, color: color || '#ffcc44', life: life == null ? 1.2 : life });
   }
 
   function clientToCanvas(clientX, clientY) {
@@ -134,7 +147,7 @@
     };
   }
 
-  
+  /** Derive pressed.left/right from ANY active pointer over those buttons (+ keyboard). */
   function rebuildPressed() {
     const keyLeft = !!pressed._keyLeft;
     const keyRight = !!pressed._keyRight;
@@ -168,11 +181,14 @@
       if (UI.hitPad(x, y, controls.left)) return { action: 'left', rect: controls.left };
       if (UI.hitPad(x, y, controls.right)) return { action: 'right', rect: controls.right };
       if (UI.hitPad(x, y, controls.drink)) return { action: 'drink', rect: controls.drink };
-      if (showPatronUI && activePatron && activePatron.state === 'talking') {
+      if (UI.hitPad(x, y, controls.line)) return { action: 'line', rect: controls.line };
+      if (UI.hitPad(x, y, controls.crash)) return { action: 'crash', rect: controls.crash };
+      if (showPatronUI && activePatron && activePatron.state === 'talking' && crashOutTimer <= 0) {
         if (UI.hitPad(x, y, controls.ignore)) return { action: 'ignore', rect: controls.ignore };
         if (UI.hitPad(x, y, controls.flirt)) return { action: 'flirt', rect: controls.flirt };
         if (UI.hitPad(x, y, controls.yell)) return { action: 'yell', rect: controls.yell };
       }
+      // Floor drag zone (above controls)
       if (y < H - 160) return { action: 'floor', rect: null };
     }
     return null;
@@ -193,6 +209,8 @@
       return;
     }
     if (action === 'drink') { doDrink(); return; }
+    if (action === 'line') { doLine(); return; }
+    if (action === 'crash') { doCrashOut(true); return; }
     if (action === 'ignore') { doIgnore(); return; }
     if (action === 'flirt') { doFlirt(); return; }
     if (action === 'yell') { doYell(); return; }
@@ -213,6 +231,7 @@
       downInRect: !!action && action !== 'floor',
     });
 
+    // Floor drag only for the finger that started the drag
     if (action === 'floor') {
       ashTarget = Math.max(50, Math.min(W - 50, p.x));
     }
@@ -229,11 +248,13 @@
     entry.x = p.x;
     entry.y = p.y;
 
+    // Floor drag: only the finger that started it
     if (entry.action === 'floor' && state === 'play') {
       ashTarget = Math.max(50, Math.min(W - 50, p.x));
       return;
     }
 
+    // Hold left/right: slide onto/off
     if (state === 'play') {
       controls = UI.layoutPlayControls(W, H);
       if (UI.hitPad(p.x, p.y, controls.left)) {
@@ -249,6 +270,7 @@
       }
     }
 
+    // Release-actions: cancel highlight if finger left padded rect
     if (entry.action && RELEASE_ACTIONS[entry.action] && entry.rect) {
       entry.downInRect = UI.hitPad(p.x, p.y, entry.rect);
     }
@@ -261,12 +283,14 @@
     if (!entry) return;
     const p = clientToCanvas(clientX, clientY);
 
+    // DRINK/LINE/CRASH/IGNORE/FLIRT/YELL/PLAY/RETRY: fire on pointerup if still inside padded hit rect
     if (entry.action && RELEASE_ACTIONS[entry.action] && entry.rect) {
       if (UI.hitPad(p.x, p.y, entry.rect)) {
         fireAction(entry.action);
       }
     }
 
+    // Clear ONLY this finger's state (never wipe all pointers)
     pointers.delete(id);
     rebuildPressed();
   }
@@ -278,6 +302,7 @@
     }
   }
 
+  // Touch events — per changedTouches[i].identifier (NOT touches[0])
   canvas.addEventListener('touchstart', function (e) {
     e.preventDefault();
     for (let i = 0; i < e.changedTouches.length; i++) {
@@ -308,6 +333,7 @@
     }
   }, { passive: false });
 
+  // Mouse = single pointer id 'mouse'
   canvas.addEventListener('mousedown', function (e) {
     e.preventDefault();
     onPointerDown('mouse', e.clientX, e.clientY);
@@ -325,6 +351,7 @@
     clearPointer('mouse');
   });
 
+  // Keyboard still works if present
   window.addEventListener('keydown', function (e) {
     if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') {
       pressed._keyLeft = true;
@@ -337,6 +364,14 @@
     if ((e.key === ' ' || e.key === 'Enter') && state === 'play') {
       e.preventDefault();
       doDrink();
+    }
+    if ((e.key === 'l' || e.key === 'L') && state === 'play') {
+      e.preventDefault();
+      doLine();
+    }
+    if ((e.key === 'c' || e.key === 'C') && state === 'play') {
+      e.preventDefault();
+      doCrashOut();
     }
     if ((e.key === 'Enter' || e.key === ' ') && state === 'title') {
       e.preventDefault();
@@ -359,6 +394,7 @@
   });
 
   function doDrink() {
+    if (state !== 'play' || crashOutTimer > 0) return;
     if (drinkCooldown > 0) return;
     drinkCooldown = 0.45;
     shots++;
@@ -371,25 +407,89 @@
     if (buzz >= 100) endGame('blackout');
   }
 
+  function doLine() {
+    if (state !== 'play' || crashOutTimer > 0 || lineCooldown > 0) return;
+    lineCooldown = 1.6;
+    score += 18;
+    const gain = 22 + Math.random() * 14; // big rail buzz/chaos spike
+    buzz = Math.min(100, buzz + gain);
+    addFloat('LINE!', ashX, H * 0.50, '#ffe066', 1.4);
+    addFloat('RAIL', ashX, H * 0.46, '#ff88ff', 1.0);
+    addFloat(Patrons.ashleyRail(), ashX, H * 0.56, '#ffccff', 1.6);
+    ashBark = { text: Patrons.ashleyRail(), life: 1.6 };
+    beep(880, 0.08, 'square', 0.07);
+    beep(220, 0.12, 'sawtooth', 0.09);
+    beep(1100, 0.1, 'triangle', 0.05);
+    // Auto mid-round crash-out after enough rails / high chaos
+    linesDone = (typeof linesDone === 'number' ? linesDone : 0) + 1;
+    linesSinceCrash = (typeof linesSinceCrash === 'number' ? linesSinceCrash : 0) + 1;
+    if (linesSinceCrash >= 3 || (buzz >= 78 && Math.random() < 0.35)) {
+      doCrashOut();
+    } else if (buzz >= 100) {
+      endGame('blackout');
+    }
+  }
+
+  function doCrashOut(endRound) {
+    if (state !== 'play' || crashOutTimer > 0 || crashCooldown > 0) return;
+    crashOutTimer = 2.2;
+    crashCooldown = 2.0;
+    linesSinceCrash = 0;
+    // Clear active / nearby patrons — flee
+    if (activePatron) {
+      activePatron.state = 'leaving';
+      activePatron.leaveDir = activePatron.x < ashX ? -1 : 1;
+      activePatron.speed *= 2.2;
+      activePatron = null;
+    }
+    let cleared = 0;
+    patrons.forEach(function (p) {
+      if (p.state === 'talking' || p.state === 'approaching') {
+        p.state = 'leaving';
+        p.leaveDir = p.x < ashX ? -1 : 1;
+        p.speed *= 2.0;
+        cleared++;
+      }
+    });
+    showPatronUI = false;
+    handled += Math.max(1, cleared);
+    score += 40 + cleared * 12;
+    let gain = 15 + Math.random() * 13; // +15..28
+    if (buzz > 85) gain = Math.max(gain, (100 - buzz) + 1 + Math.random() * 8);
+    buzz = Math.min(100, buzz + gain);
+    addFloat('CRASHING OUT', ashX, H * 0.52, '#ff4466', 1.8);
+    ashBark = { text: Patrons.ashleyCrash(), life: 2.2 };
+    beep(90, 0.25, 'sawtooth', 0.12);
+    beep(160, 0.2, 'square', 0.08);
+    // CRASH button ends the round; auto mid-round crash keeps playing unless blackout
+    if (endRound) {
+      endGame('crash');
+      return;
+    }
+    if (buzz >= 100) endGame('blackout');
+  }
+
   function doIgnore() {
+    if (crashOutTimer > 0) return;
     if (!activePatron || activePatron.state !== 'talking') return;
     activePatron.state = 'leaving';
     activePatron.leaveDir = Math.random() < 0.5 ? -1 : 1;
     handled++;
     score += 8;
-    addFloat('IGNORED', activePatron.x, activePatron.y - 40, '#aaaaaa');
+    addFloat(Patrons.ashleyIgnore(), activePatron.x, activePatron.y - 40, '#aaaaaa');
     beep(300, 0.08);
     activePatron = null;
     showPatronUI = false;
   }
 
   function doFlirt() {
+    if (crashOutTimer > 0) return;
     if (!activePatron || activePatron.state !== 'talking') return;
     const swing = (Math.random() < 0.5 ? -1 : 1) * (12 + Math.random() * 18);
     buzz = Math.max(0, Math.min(100, buzz + swing));
     handled++;
     score += 15;
-    const msg = swing > 0 ? 'FLIRTY BUZZ +' + Math.floor(swing) : 'AWKWARD ' + Math.floor(swing);
+    const msg = Patrons.ashleyFlirt(swing > 0);
     addFloat(msg, activePatron.x, activePatron.y - 40, swing > 0 ? '#ff88aa' : '#ffaa44');
     activePatron.state = 'leaving';
     activePatron.leaveDir = swing > 0 ? 1 : -1;
@@ -401,11 +501,12 @@
   }
 
   function doYell() {
+    if (crashOutTimer > 0) return;
     if (!activePatron || activePatron.state !== 'talking') return;
     buzz = Math.max(0, buzz - 8);
     handled++;
     score += 10;
-    addFloat('GET LOST!', activePatron.x, activePatron.y - 40, '#ff6644');
+    addFloat(Patrons.ashleyYell(), activePatron.x, activePatron.y - 40, '#ff6644');
     activePatron.state = 'leaving';
     activePatron.leaveDir = activePatron.x < ashX ? -1 : 1;
     activePatron.speed *= 1.8;
@@ -421,6 +522,7 @@
     score += shots * 5;
     score += handled * 10;
     if (reason === 'win') score += 100;
+    if (reason === 'crash') score += 25;
 
     const high = getHighScore();
     const newHigh = score > high;
@@ -438,7 +540,11 @@
     state = 'results';
     pointers.clear();
     pressed = {};
-    if (reason === 'win') {
+    crashOutTimer = 0;
+    if (reason === 'blackout' || reason === 'crash') {
+      addFloat(Patrons.ashleyCrash(), ashX, H * 0.5, '#ff6688', 2.5);
+      beep(120, 0.3, 'sawtooth', 0.1);
+    } else if (reason === 'win') {
       beep(523, 0.1); beep(659, 0.1); beep(784, 0.2);
     } else {
       beep(120, 0.3, 'sawtooth', 0.1);
@@ -457,25 +563,44 @@
       return;
     }
 
-    const moveSpeed = 160;
+    const crashing = crashOutTimer > 0;
+    const moveSpeed = crashing ? 55 : 160;
     if (pressed.left) ashTarget = Math.max(50, ashX - moveSpeed * dt * 3);
     if (pressed.right) ashTarget = Math.min(W - 50, ashX + moveSpeed * dt * 3);
-    ashX += (ashTarget - ashX) * Math.min(1, 8 * dt);
+    ashX += (ashTarget - ashX) * Math.min(1, (crashing ? 3 : 8) * dt);
 
     buzz = Math.max(0, buzz - 3.2 * dt);
     drinkCooldown = Math.max(0, drinkCooldown - dt);
+    lineCooldown = Math.max(0, lineCooldown - dt);
+    if (!crashing) crashCooldown = Math.max(0, crashCooldown - dt);
 
-    if (buzz < 25) {
-      soberTimer += dt;
-      if (soberTimer > SOBER_FAIL) {
-        endGame('sober');
-        return;
+    // Crash-out tick — set crashCooldown when timer hits 0
+    if (crashing) {
+      crashOutTimer = Math.max(0, crashOutTimer - dt);
+      if (crashOutTimer <= 0) {
+        crashCooldown = 8;
+        if (buzz >= 100) {
+          endGame('crash');
+          return;
+        }
       }
-    } else {
-      soberTimer = Math.max(0, soberTimer - dt * 0.5);
     }
 
-    if (buzz >= 100) {
+    // TOO SOBER: buzz < 25 for >6s continuous (paused during crash-out)
+    if (!crashing) {
+      if (buzz < 25) {
+        soberTimer += dt;
+        if (soberTimer > SOBER_FAIL) {
+          endGame('sober');
+          return;
+        }
+      } else {
+        soberTimer = Math.max(0, soberTimer - dt * 0.5);
+      }
+    }
+
+    // Blackout only outside active crash-out (crash expiry handles crash fail)
+    if (!crashing && buzz >= 100) {
       endGame('blackout');
       return;
     }
@@ -484,7 +609,7 @@
     const talking = patrons.filter(function (p) {
       return p.state === 'talking' || p.state === 'approaching';
     });
-    if (spawnTimer >= nextSpawn && talking.length < 2) {
+    if (!crashing && spawnTimer >= nextSpawn && talking.length < 2) {
       spawnTimer = 0;
       nextSpawn = 4 + Math.random() * 4 - Math.min(2, (ROUND_TIME - timeLeft) / 40);
       const np = Patrons.createPatron(W, H, Math.random() < 0.5);
@@ -495,16 +620,20 @@
     patrons.forEach(function (p) { Patrons.updatePatron(p, dt, W); });
     patrons = patrons.filter(function (p) { return p.state !== 'gone'; });
 
-    const talkers = patrons.filter(function (p) { return p.state === 'talking'; });
-    if (talkers.length) {
-      talkers.sort(function (a, b) { return Math.abs(a.x - ashX) - Math.abs(b.x - ashX); });
-      activePatron = talkers[0];
-      showPatronUI = true;
-    } else {
-      if (activePatron && activePatron.state !== 'talking') {
-        activePatron = null;
+    if (!crashing) {
+      const talkers = patrons.filter(function (p) { return p.state === 'talking'; });
+      if (talkers.length) {
+        talkers.sort(function (a, b) { return Math.abs(a.x - ashX) - Math.abs(b.x - ashX); });
+        activePatron = talkers[0];
+        showPatronUI = true;
+      } else {
+        if (activePatron && activePatron.state !== 'talking') {
+          activePatron = null;
+        }
+        showPatronUI = !!activePatron && activePatron.state === 'talking';
       }
-      showPatronUI = !!activePatron && activePatron.state === 'talking';
+    } else {
+      showPatronUI = false;
     }
 
     floatTexts.forEach(function (f) {
@@ -512,16 +641,24 @@
       f.y -= 30 * dt;
     });
     floatTexts = floatTexts.filter(function (f) { return f.life > 0; });
+
+    if (ashBark) {
+      ashBark.life -= dt;
+      if (ashBark.life <= 0) ashBark = null;
+    }
   }
 
   function ashleyFrameId() {
     if (state === 'results' && resultData) {
-      if (resultData.reason === 'blackout') return 'fail_blackout';
+      if (resultData.reason === 'blackout' || resultData.reason === 'crash') return 'fail_blackout';
       if (resultData.reason === 'win') return 'win_smug';
       if (resultData.reason === 'sober') return 'reject';
     }
+    if (crashOutTimer > 0) return (frame % 16 < 8) ? 'pass_out' : 'reject';
+    if (ashBark && ashBark.life > 0.3) return 'talk';
     if (drinkCooldown > 0.2) return 'drink_raise';
     if (drinkCooldown > 0) return 'drink_sip';
+    if (lineCooldown > 0.35) return 'buzz_high';
     if (buzz > 80) return 'buzz_high';
     if (buzz > 55) return 'buzz_mid';
     if (buzz < 25) return 'buzz_low';
@@ -532,6 +669,7 @@
     ctx.clearRect(0, 0, W, H);
 
     if (state === 'title') {
+      // Shared layout helper — never call drawTitleScreen from tap handlers
       titleBtns = UI.drawTitleScreen(ctx, W, H, getHighScore(), frame);
       if (pressed.play) {
         UI.drawButton(ctx, titleBtns.play, 'PLAY', { pressed: true, fontSize: 22, accent: '#ffee88', bg: '#5a1820' });
@@ -540,6 +678,7 @@
     }
 
     Sprites.drawBarBackground(ctx, W, H);
+    // Bartender behind center island
     Sprites.drawBartender(ctx, W / 2, H * 0.44, 1.0, frame);
 
     const sorted = patrons.slice().sort(function (a, b) { return a.y - b.y; });
@@ -547,19 +686,29 @@
       const pose = p.state === 'approaching' || p.state === 'leaving' ? 'walk' :
                    (p.state === 'talking' ? 'talk' : 'idle');
       Sprites.drawPatron(ctx, p.x, p.y, 1.15, p.variant, frame + p.age * 10, p.facing, pose);
-      if (p.state === 'talking' && p === activePatron) {
+      if (p.state === 'talking' && p === activePatron && crashOutTimer <= 0) {
         Sprites.drawSpeechBubble(ctx, p.x, p.y - 50, p.line, 160);
       }
     });
 
+    // Ashley walks in front / sides of island
     Sprites.drawAshley(ctx, ashX, H * 0.58, 1.35, frame, true, ashleyFrameId());
 
+    if (ashBark && ashBark.text) {
+      Sprites.drawSpeechBubble(ctx, ashX, H * 0.48, ashBark.text, 170);
+    }
+
+    // HUD — pass soberTimer for fuse UI
     UI.drawBuzzMeter(ctx, 20, 100, W - 40, 18, buzz, soberTimer);
     UI.drawTimer(ctx, W / 2, 55, timeLeft, ROUND_TIME);
     const liveScore = score + Math.floor(survived) * 2;
     UI.drawScoreHud(ctx, 16, 148, liveScore, shots, handled);
 
-    if (buzz < 25) {
+    if (crashOutTimer > 0 && UI.drawCrashBanner) {
+      UI.drawCrashBanner(ctx, W, H, crashOutTimer, frame);
+    }
+
+    if (buzz < 25 && crashOutTimer <= 0) {
       ctx.fillStyle = 'rgba(80,120,255,' + (0.08 + Math.sin(frame * 0.2) * 0.05) + ')';
       ctx.fillRect(0, 0, W, H);
       ctx.fillStyle = '#88aaff';
@@ -579,21 +728,40 @@
     controls = UI.layoutPlayControls(W, H);
     UI.drawButton(ctx, controls.left, '◀', { pressed: pressed.left, fontSize: 24 });
     UI.drawButton(ctx, controls.right, '▶', { pressed: pressed.right, fontSize: 24 });
+
+    const lineDisabled = lineCooldown > 0 || crashOutTimer > 0;
+    const crashDisabled = crashCooldown > 0 || crashOutTimer > 0;
+    const drinkDisabled = drinkCooldown > 0 || crashOutTimer > 0;
+
+    // Bright labels: ◀ ▶ | CRASH | LINE | DRINK — thumb-obvious on phone
+    UI.drawButton(ctx, controls.crash, 'CRASH', {
+      pressed: pressed.crash,
+      fontSize: 15,
+      accent: crashDisabled ? '#886666' : '#ffee66',
+      bg: crashDisabled ? '#2a2020' : '#8a1028',
+      danger: !crashDisabled,
+    });
+    UI.drawButton(ctx, controls.line, 'LINE', {
+      pressed: pressed.line,
+      fontSize: 16,
+      accent: lineDisabled ? '#776688' : '#ffffff',
+      bg: lineDisabled ? '#2a2030' : '#7a20a8',
+    });
     UI.drawButton(ctx, controls.drink, 'DRINK', {
       pressed: pressed.drink,
       fontSize: 16,
-      accent: '#88ddff',
-      bg: drinkCooldown > 0 ? '#2a2030' : '#203050',
+      accent: drinkDisabled ? '#667788' : '#88ddff',
+      bg: drinkDisabled ? '#2a2030' : '#203050',
     });
 
-    if (showPatronUI && activePatron) {
+    if (showPatronUI && activePatron && crashOutTimer <= 0) {
       UI.drawButton(ctx, controls.ignore, 'IGNORE', { pressed: pressed.ignore, fontSize: 13, accent: '#ccccaa' });
       UI.drawButton(ctx, controls.flirt, 'FLIRT', { pressed: pressed.flirt, fontSize: 13, accent: '#ff88aa', bg: '#4a1828' });
       UI.drawButton(ctx, controls.yell, 'YELL', { pressed: pressed.yell, fontSize: 13, accent: '#ff6644', danger: true });
     }
 
     floatTexts.forEach(function (f) {
-      ctx.globalAlpha = Math.max(0, f.life);
+      ctx.globalAlpha = Math.max(0, Math.min(1, f.life));
       ctx.fillStyle = f.color;
       ctx.font = 'bold 14px Courier New, monospace';
       ctx.textAlign = 'center';
@@ -616,8 +784,9 @@
     requestAnimationFrame(loop);
   }
 
+  // Kick sheet load (non-blocking; procedural fallback until ready)
   if (Sprites.loadSheets) {
-    Sprites.loadSheets('assets/').catch(function () {  });
+    Sprites.loadSheets('assets/').catch(function () { /* fallback stays */ });
   }
 
   requestAnimationFrame(loop);

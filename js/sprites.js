@@ -1,4 +1,4 @@
-
+/* Fatshley Ashley — sheet blits + procedural fallback */
 (function (global) {
   'use strict';
 
@@ -20,6 +20,7 @@
     stool: '#3a2010',
   };
 
+  // Sheet state — drop-in: replace ashley_sheet.png / patrons_sheet.png / bar_tiles.png
   let atlas = null;
   let ashleyImg = null;
   let patronsImg = null;
@@ -42,19 +43,34 @@
     });
   }
 
+  function resolveAsset(base, name) {
+    const map = global.__FATSHLEY_ASSETS;
+    if (map && map[name]) return map[name];
+    // Already a data URL / absolute URL
+    if (/^(data:|blob:|https?:|\/)/.test(name)) return name;
+    return (base || 'assets/') + name;
+  }
+
   function loadSheets(base) {
     base = base || 'assets/';
     if (loadPromise) return loadPromise;
     loadPromise = (async function () {
-      const atlasUrl = base + 'atlas.json';
-      const res = await fetch(atlasUrl);
-      if (!res.ok) throw new Error('atlas fetch failed');
-      atlas = await res.json();
-      const aPath = base + (atlas.ashley.image || 'ashley_sheet.png');
-      const pPath = base + (atlas.patrons.image || 'patrons_sheet.png');
-      const tPath = base + ((atlas.tiles && atlas.tiles.image) || 'bar_tiles.png');
+      const map = global.__FATSHLEY_ASSETS;
+      if (map && map['atlas.json']) {
+        atlas = typeof map['atlas.json'] === 'string'
+          ? JSON.parse(map['atlas.json'])
+          : map['atlas.json'];
+      } else {
+        const atlasUrl = base + 'atlas.json';
+        const res = await fetch(atlasUrl);
+        if (!res.ok) throw new Error('atlas fetch failed');
+        atlas = await res.json();
+      }
+      const aPath = resolveAsset(base, atlas.ashley.image || 'ashley_sheet.png');
+      const pPath = resolveAsset(base, atlas.patrons.image || 'patrons_sheet.png');
+      const tPath = resolveAsset(base, (atlas.tiles && atlas.tiles.image) || 'bar_tiles.png');
       const bt = atlas.bar_tavern;
-      const tavernPath = bt ? base + (bt.image || 'bar_tavern.png') : null;
+      const tavernPath = bt ? resolveAsset(base, bt.image || 'bar_tavern.png') : null;
       ashleyImg = await loadImage(aPath);
       patronsImg = await loadImage(pPath);
       tilesImg = null;
@@ -78,7 +94,7 @@
     return loadPromise;
   }
 
-  
+  /** Nearest-neighbor blit from a sheet frame. */
   function blit(ctx, img, frame, dx, dy, scale) {
     if (!img || !frame) return;
     scale = scale == null ? 1 : scale;
@@ -121,11 +137,13 @@
     return !!(ready && tavernImg && atlas && atlas.bar_tavern && atlas.bar_tavern.frames);
   }
 
+  // Feet pivot: bottom of 64×80 cell − 2px → draw at (x - 32*s, y - 78*s)
   function feetPivot(x, y, scale) {
     return { dx: x - 32 * scale, dy: y - 78 * scale };
   }
 
   function drawNeonSign(ctx, cx, y) {
+    // Prefer neon letter tiles (c/a/n/d) + text fallback for full "Candlelight Tavern"
     if (ready && tilesImg && tileFrame('neon_c')) {
       const letters = ['neon_c', 'neon_a', 'neon_n', 'neon_d'];
       const scale = 1;
@@ -137,6 +155,7 @@
         blitTile(ctx, id, lx, y - 20, scale);
         lx += cell + gap;
       });
+      // Full venue name as neon text (tiles only cover CAND)
       ctx.save();
       ctx.font = 'bold 12px Courier New, monospace';
       ctx.textAlign = 'center';
@@ -169,7 +188,7 @@
     ctx.restore();
   }
 
-  
+  /** Marquee strip helper: frame_l + neon_0..3 + frame_r (optional mid rail). */
   function blitMarqueeStrip(ctx, neonIds, x, y, scale) {
     scale = scale == null ? 1 : scale;
     const cell = 32 * scale;
@@ -184,11 +203,12 @@
     return cx + cell - x;
   }
 
-  
+  /** Denver Candlelight Tavern pack — brick, neon marquee, center island. */
   function drawBarBackgroundTavern(ctx, W, H) {
     const floorY = Math.floor(H * 0.42);
     const bricks = ['brick_a', 'brick_b', 'brick_dark', 'brick_mortar', 'brick_soot'];
 
+    // Brick back wall
     for (let y = 0; y < floorY; y += 32) {
       for (let x = 0; x < W; x += 32) {
         const col = Math.floor(x / 32);
@@ -200,6 +220,7 @@
       }
     }
 
+    // Wall TVs + amber sconces
     blitTavern(ctx, 'tv_sports', 18, 28, 1);
     blitTavern(ctx, 'tv_fight', W - 50, 28, 1);
     blitTavern(ctx, 'amber_sconce', 56, 20, 1);
@@ -209,6 +230,7 @@
     blitTavern(ctx, 'amber_lamp', 90, 70, 0.9);
     blitTavern(ctx, 'amber_lamp', W - 122, 70, 0.9);
 
+    // Marquee: COCKTAILS over FINE FOOD; CANDLELIGHT + TAVERN as venue name
     const cocktails = [
       'marquee_neon_cocktails_0', 'marquee_neon_cocktails_1',
       'marquee_neon_cocktails_2', 'marquee_neon_cocktails_3',
@@ -228,6 +250,7 @@
     const mx = Math.floor((W - stripW) / 2);
     blitMarqueeStrip(ctx, cocktails, mx, 8, 1);
     blitMarqueeStrip(ctx, finefood, mx, 40, 1);
+    // Venue name — Candlelight Tavern (no fake "Candlelight Bar")
     const nameY = 72;
     const nameScale = 0.85;
     const nameCell = 32 * nameScale;
@@ -238,6 +261,7 @@
       blitMarqueeStrip(ctx, tavern, nx, nameY + Math.floor(nameCell) + 2, nameScale);
     }
 
+    // Floor — prefer legacy wood tiles if present, else brick underfoot
     for (let y = floorY; y < H; y += 32) {
       for (let x = 0; x < W; x += 32) {
         if (tileFrame('floor_wood_a') && tilesImg) {
@@ -256,17 +280,21 @@
       }
     }
 
+    // Background activity hints (sides of room)
     blitTavern(ctx, 'pool_felt_a', 8, floorY + 8, 0.9);
     blitTavern(ctx, 'pool_felt_b', 8, floorY + 36, 0.9);
     blitTavern(ctx, 'shuffleboard_a', W - 40, floorY + 10, 0.9);
     blitTavern(ctx, 'shuffleboard_b', W - 40, floorY + 38, 0.9);
 
+    // Center island bar — blit order from ASSETS.md
     const islandW = Math.min(260, W - 80);
     const islandX = Math.floor((W - islandW) / 2);
     const barTopY = Math.floor(H * 0.46);
     const barDepth = 56;
     const frontY = barTopY + 28;
 
+    // (1) floor already drawn under island
+    // (2) far-side top first so island reads as wrapping, then front + ends
     for (let x = islandX + 16; x < islandX + islandW - 16; x += 32) {
       blitTavern(ctx, 'center_bar_top', x, barTopY - 8, 1);
     }
@@ -277,17 +305,22 @@
     blitTavern(ctx, 'center_bar_end_l', islandX - 16, barTopY + 4, 1);
     blitTavern(ctx, 'center_bar_end_r', islandX + islandW - 16, barTopY + 4, 1);
 
+    // (3) top fill
     for (let x = islandX; x < islandX + islandW; x += 32) {
       blitTavern(ctx, 'center_bar_top', x, barTopY, 1);
     }
+    // (4) near corners
     blitTavern(ctx, 'center_bar_corner_l', islandX - 8, frontY - 4, 1);
     blitTavern(ctx, 'center_bar_corner_r', islandX + islandW - 24, frontY - 4, 1);
+    // (5) shine on top surface
     for (let x = islandX + 16; x < islandX + islandW - 16; x += 32) {
       blitTavern(ctx, 'center_bar_shine', x, barTopY, 1);
     }
 
+    // Greasy burger on island
     blitTavern(ctx, 'burger_plate', islandX + Math.floor(islandW / 2) - 16, barTopY - 6, 1);
 
+    // Optional wall shelf/bottles from legacy tiles behind island
     if (tilesImg && tileFrame('shelf')) {
       for (let x = islandX + 16; x < islandX + islandW - 16; x += 32) {
         blitTile(ctx, 'shelf', x, 108, 1);
@@ -300,6 +333,7 @@
       }
     }
 
+    // (6) stools around perimeter
     const stoolY = frontY + 42;
     const stoolXs = [
       islandX - 14,
@@ -320,39 +354,45 @@
     });
   }
 
-  
+  /** Legacy atlas.tiles center-island bar (NOT wall-hug). Floor surrounds it. */
   function drawBarBackgroundSheet(ctx, W, H) {
     const floorY = Math.floor(H * 0.42);
 
+    // Back wall
     for (let y = 0; y < floorY; y += 32) {
       for (let x = 0; x < W; x += 32) {
         const id = (Math.floor(x / 32) % 3 === 1) ? 'wall_stripe' : 'wall_dark';
         blitTile(ctx, id, x, y, 1);
       }
     }
+    // Neon pink accent strip under sign
     for (let x = 40; x < W - 40; x += 32) {
       blitTile(ctx, 'wall_neon_pink', x, 52, 1);
     }
 
     drawNeonSign(ctx, W / 2, 38);
 
+    // Floor around island (checker)
     for (let y = floorY; y < H; y += 32) {
       for (let x = 0; x < W; x += 32) {
         const id = ((x + y) / 32) % 2 === 0 ? 'floor_wood_a' : 'floor_wood_b';
         blitTile(ctx, id, x, y, 1);
       }
     }
+    // Plank lines
     for (let y = floorY; y < H; y += 48) {
       for (let x = 0; x < W; x += 32) {
         blitTile(ctx, 'floor_plank_line', x, y, 1);
       }
     }
 
+    // Center island bar (wraparound counter in middle of room)
     const islandW = Math.min(260, W - 80);
     const islandX = Math.floor((W - islandW) / 2);
     const barTopY = Math.floor(H * 0.46);
     const barFrontH = 48;
 
+    // Shelf behind island (on wall)
     for (let x = islandX; x < islandX + islandW; x += 32) {
       blitTile(ctx, 'shelf', x, 78, 1);
     }
@@ -363,20 +403,25 @@
       blitTile(ctx, bottles[i % bottles.length], bx, 52, 0.85);
     }
 
+    // Bar top (island surface)
     for (let x = islandX; x < islandX + islandW; x += 32) {
       blitTile(ctx, 'bar_top', x, barTopY, 1);
     }
+    // Shine overlay
     for (let x = islandX + 16; x < islandX + islandW - 16; x += 32) {
       blitTile(ctx, 'bar_shine', x, barTopY, 1);
     }
+    // Bar front
     for (let row = 0; row < Math.ceil(barFrontH / 32); row++) {
       for (let x = islandX; x < islandX + islandW; x += 32) {
         blitTile(ctx, 'bar_front', x, barTopY + 28 + row * 28, 1);
       }
     }
+    // Counter edges
     blitTile(ctx, 'counter_edge', islandX - 8, barTopY + 20, 1);
     blitTile(ctx, 'counter_edge', islandX + islandW - 24, barTopY + 20, 1);
 
+    // Stools around the island (front + sides — Ashley walks in front/sides)
     const stoolY = barTopY + 70;
     const stoolXs = [
       islandX - 10,
@@ -394,29 +439,61 @@
   }
 
   function drawBarBackgroundProcedural(ctx, W, H) {
-    const grad = ctx.createLinearGradient(0, 0, 0, H * 0.45);
-    grad.addColorStop(0, '#2a0810');
-    grad.addColorStop(1, '#4a1520');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, W, H * 0.45);
-
-    ctx.fillStyle = 'rgba(0,0,0,0.15)';
-    for (let x = 0; x < W; x += 24) {
-      ctx.fillRect(x, 0, 8, H * 0.45);
+    const floorY = Math.floor(H * 0.42);
+    // Obvious brick back wall (never a flat empty room)
+    const brickColors = ['#5a2018', '#4a1810', '#6a281c', '#3a100c', '#522018'];
+    const mortar = '#2a1810';
+    for (let row = 0; row * 16 < floorY; row++) {
+      const y = row * 16;
+      const offset = (row % 2) * 16;
+      for (let x = -offset; x < W; x += 32) {
+        const c = brickColors[((row * 3) + Math.floor((x + offset) / 32)) % brickColors.length];
+        px(ctx, x, y, 30, 14, c);
+        px(ctx, x, y + 14, 32, 2, mortar);
+        px(ctx, x + 30, y, 2, 14, mortar);
+      }
     }
+    // Dark wash so bricks read as dive-bar wall
+    ctx.fillStyle = 'rgba(20,4,8,0.25)';
+    ctx.fillRect(0, 0, W, floorY);
 
+    // Floor planks
     ctx.fillStyle = P.floor;
-    ctx.fillRect(0, H * 0.45, W, H * 0.55);
-    ctx.fillStyle = 'rgba(0,0,0,0.2)';
-    for (let y = H * 0.45; y < H; y += 18) {
-      ctx.fillRect(0, y, W, 2);
-    }
-    for (let x = 0; x < W; x += 28) {
-      ctx.fillRect(x, H * 0.45, 2, H * 0.55);
-    }
+    ctx.fillRect(0, floorY, W, H - floorY);
+    ctx.fillStyle = 'rgba(0,0,0,0.22)';
+    for (let y = floorY; y < H; y += 18) ctx.fillRect(0, y, W, 2);
+    for (let x = 0; x < W; x += 28) ctx.fillRect(x, floorY, 2, H - floorY);
 
     drawNeonSign(ctx, W / 2, 38);
+    // Marquee frame hint
+    ctx.strokeStyle = P.neonPink;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(W / 2 - 110, 18, 220, 36);
+    ctx.strokeStyle = P.neon;
+    ctx.strokeRect(W / 2 - 100, 54, 200, 22);
 
+    // Green pool table (left) — obvious felt rectangle
+    const poolX = 10, poolY = floorY + 12, poolW = 72, poolH = 96;
+    px(ctx, poolX, poolY, poolW, poolH, '#1a4a28');
+    px(ctx, poolX + 4, poolY + 4, poolW - 8, poolH - 8, '#2a7a40');
+    px(ctx, poolX, poolY, poolW, 6, '#3a2010');
+    px(ctx, poolX, poolY + poolH - 6, poolW, 6, '#3a2010');
+    px(ctx, poolX, poolY, 6, poolH, '#3a2010');
+    px(ctx, poolX + poolW - 6, poolY, 6, poolH, '#3a2010');
+    // cue ball hint
+    px(ctx, poolX + 28, poolY + 40, 6, 6, '#f0f0e8');
+    px(ctx, poolX + 42, poolY + 52, 5, 5, '#cc2222');
+    px(ctx, poolX + 20, poolY + 58, 5, 5, '#2266cc');
+
+    // Shuffleboard (right)
+    const shX = W - 48, shY = floorY + 14;
+    px(ctx, shX, shY, 36, 110, '#c8b070');
+    px(ctx, shX + 4, shY + 4, 28, 102, '#e8d090');
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    for (let i = 0; i < 5; i++) ctx.fillRect(shX + 6, shY + 16 + i * 18, 24, 2);
+    px(ctx, shX + 12, shY + 88, 10, 10, '#d0d0d8');
+
+    // Bottle shelf on back wall
     px(ctx, 40, 70, W - 80, 8, P.woodDark);
     px(ctx, 40, 78, W - 80, 4, P.wood);
     const bottles = [
@@ -433,6 +510,7 @@
       px(ctx, x + 3, 40, 4, 4, '#888');
     });
 
+    // CENTER ISLAND bar (not wall-hug)
     const islandW = Math.min(260, W - 80);
     const islandX = (W - islandW) / 2;
     const barY = H * 0.46;
@@ -441,7 +519,11 @@
     px(ctx, islandX, barY + 28, islandW, 6, P.woodLight);
     ctx.fillStyle = 'rgba(255,200,100,0.08)';
     ctx.fillRect(islandX + 4, barY + 2, islandW - 8, 8);
+    // greasy burger hint on island
+    px(ctx, islandX + islandW / 2 - 10, barY - 4, 20, 8, '#c8a050');
+    px(ctx, islandX + islandW / 2 - 8, barY - 8, 16, 6, '#60a040');
 
+    // Stools around island front/sides
     const stoolYs = barY + 78;
     const stoolXs = [islandX - 8, islandX + 50, islandX + islandW / 2 - 14, islandX + islandW - 78, islandX + islandW - 22];
     stoolXs.forEach(function (sx) {
@@ -594,8 +676,10 @@
   function drawPatronSheet(ctx, x, y, scale, variant, frame, facing, poseOrState) {
     const v = (variant % 4 + 4) % 4;
     const pose = poseFromState(poseOrState);
+    // Alternate walk frame via idle flicker when walking long
     let key = 'v' + v + '_' + pose;
     if (pose === 'walk' && frame % 20 < 10) {
+      // walk sheet is single frame; slight bob via y
     }
     const fr = atlas.patrons.frames[key] || atlas.patrons.frames['v' + v + '_idle'];
     const piv = feetPivot(x, y, scale);
@@ -667,7 +751,7 @@
     ctx.restore();
   }
 
-  
+  /** poseOrState: 'idle'|'walk'|'talk' or patron state string */
   function drawPatron(ctx, x, y, scale, variant, frame, facing, poseOrState) {
     if (ready && patronsImg && atlas && atlas.patrons) {
       drawPatronSheet(ctx, x, y, scale, variant, frame, facing, poseOrState);
